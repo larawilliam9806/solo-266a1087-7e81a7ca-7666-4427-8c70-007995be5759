@@ -31,6 +31,7 @@ from . import layout
 from .csvparse import CsvError, parse_csv
 
 MAX_UPLOAD_BYTES = 10 * 1024 * 1024
+MAX_FOLLOWERS = 6
 
 
 def create_app(config=None):
@@ -67,6 +68,101 @@ def create_app(config=None):
         if job is None:
             abort(404)
         return job
+
+    # ------------------------------------------------------------------
+    # Cross-page bindings
+    # ------------------------------------------------------------------
+    def binding_info(job_id):
+        """Role, reference summary and pause details for one job."""
+        connection = get_db()
+        binding = db.get_binding(connection, job_id)
+        info = {
+            "is_reference": False,
+            "follows": None,
+            "reference": None,
+            "paused": False,
+            "pause_reasons": [],
+            "affected_boxes": [],
+            "followers": [],
+            "max_followers": MAX_FOLLOWERS,
+        }
+        if binding is not None:
+            reference = db.get_job(connection, binding["reference_job_id"])
+            info.update(
+                follows=binding["reference_job_id"],
+                paused=binding["paused"],
+                pause_reasons=binding["pause_reasons"],
+                affected_boxes=binding["affected_boxes"],
+                reference=None if reference is None else {
+                    "id": reference["id"], "filename": reference["filename"],
+                },
+            )
+        followers = db.list_followers(connection, job_id)
+        info["is_reference"] = bool(followers)
+        info["followers"] = [
+            {
+                "job_id": entry["target_job_id"],
+                "filename": (db.get_job(connection, entry["target_job_id"])
+                             or {}).get("filename", ""),
+                "paused": entry["paused"],
+                "pause_reasons": entry["pause_reasons"],
+            }
+            for entry in followers
+        ]
+        return info
+
+    def sync_followers(reference_job_id, verticals_changed=True):
+        """Re-derive every follower's inner verticals from the reference.
+
+        Runs inside the caller's transaction, so the reference's new lines,
+        each follower's derived lines and each follower's pause state all
+        land together (or not at all).  Followers derive their inner verticals
+        only from the reference's verticals, so a horizontal-only edit does
+        not touch them (and must not resume a paused follower).  Returns the
+        list of follower summaries for the API response.
+        """
+        if not verticals_changed:
+            return []
+        connection = get_db()
+        reference_h, reference_v = db.get_lines(connection, reference_job_id)
+        summary = []
+        for binding in db.list_followers(connection, reference_job_id):
+            target_id = binding["target_job_id"]
+            if binding["paused"]:
+                # A paused page keeps its old lines until a human explicitly
+                # accepts the reference's current widths on the page itself.
+                summary.append({
+                    "job_id": target_id,
+                    "paused": True,
+                    "pause_reasons": binding["pause_reasons"],
+                    "affected_boxes": binding["affected_boxes"],
+                })
+                continue
+            target_h, old_v = db.get_lines(connection, target_id)
+            reasons, affected, new_v = _evaluate_conversion(
+                connection, target_id, reference_v, target_h, old_v)
+
+            if reasons:
+                # Keep the follower's current lines exactly as they are and
+                # stop following until a human accepts the new widths.
+                db.update_binding(connection, target_id, True, reasons, affected)
+                summary.append({
+                    "job_id": target_id,
+                    "paused": True,
+                    "pause_reasons": reasons,
+                    "affected_boxes": affected,
+                })
+                continue
+
+            db.set_lines(connection, target_id, target_h, new_v)
+            db.update_binding(connection, target_id, False, [], [])
+            summary.append({
+                "job_id": target_id,
+                "paused": False,
+                "pause_reasons": [],
+                "affected_boxes": [],
+            })
+        return summary
 
     # ------------------------------------------------------------------
     # State computation shared by pages and API
@@ -122,6 +218,7 @@ def create_app(config=None):
             "status_counts": status_counts,
             "can_export": grid is not None and pending == 0 and bool(boxes),
             "cells": grid.cells() if grid is not None else [],
+            "binding": binding_info(job_id),
         }
 
     def _invalid_message(h_count, v_count):
@@ -167,7 +264,7 @@ def create_app(config=None):
         job_id = db.create_job(connection, filename)
         db.add_boxes(connection, job_id, parsed.boxes)
         horizontal, vertical = _suggest_lines(parsed.boxes)
-        db.set_lines(connection, job_id, horizontal, vertical)
+        db.replace_lines(connection, job_id, horizontal, vertical)
         for warning in parsed.warnings[:20]:
             flash(warning, "warning")
         flash(f"已导入 {len(parsed.boxes)} 个文字框，请核对格线", "success")
@@ -177,14 +274,27 @@ def create_app(config=None):
     def job_view(job_id):
         job = load_job_or_404(job_id)
         state = job_state(job_id)
+        candidates = [
+            entry for entry in db.list_jobs(get_db())
+            if entry["id"] != job_id
+        ]
         return render_template(
-            "job.html", job=job, state=state, state_json=_json_state(state)
+            "job.html", job=job, state=state, state_json=_json_state(state),
+            jobs=candidates,
         )
 
     @app.post("/jobs/<int:job_id>/delete")
     def job_delete(job_id):
         load_job_or_404(job_id)
-        db.delete_job(get_db(), job_id)
+        connection = get_db()
+        followers = db.count_followers(connection, job_id)
+        if followers:
+            flash(
+                f"该页仍被 {followers} 个目标页作为参考页，先解除绑定才能删除",
+                "error",
+            )
+            return redirect(url_for("job_view", job_id=job_id))
+        db.delete_job(connection, job_id)
         flash("已删除该任务", "success")
         return redirect(url_for("index"))
 
@@ -210,7 +320,141 @@ def create_app(config=None):
                 "error": error.message,
                 "details": error.details,
             }), 400
-        db.set_lines(get_db(), job_id, horizontal, vertical)
+
+        connection = get_db()
+        binding = db.get_binding(connection, job_id)
+        saved_h, saved_v = db.get_lines(connection, job_id)
+        if binding is not None:
+            # While bound, the target may edit only its horizontal lines; its
+            # verticals (outer borders included) follow the reference.
+            vertical = list(saved_v)
+            if len(vertical) != 4:
+                return jsonify({
+                    "ok": False,
+                    "error": "目标页竖线必须恰好 4 条，无法保持跟随",
+                    "details": [],
+                }), 409
+
+        verticals_changed = not _same_numbers(saved_v, vertical)
+        followed = []
+        with db.transaction(connection):
+            db.set_lines(connection, job_id, horizontal, vertical)
+            if db.list_followers(connection, job_id):
+                followed = sync_followers(job_id, verticals_changed)
+
+        state = _json_state(job_state(job_id))
+        state["followers"] = followed
+        return jsonify(state)
+
+    # ------------------------------------------------------------------
+    # Binding endpoints
+    # ------------------------------------------------------------------
+    @app.post("/api/jobs/<int:job_id>/binding")
+    def api_bind(job_id):
+        load_job_or_404(job_id)
+        payload = request.get_json(silent=True) or {}
+        reference_id = payload.get("reference_job_id")
+        if isinstance(reference_id, bool) or not isinstance(reference_id, int):
+            return jsonify({"ok": False, "error": "请选择参考页", "details": []}), 400
+        reference = db.get_job(get_db(), reference_id)
+        if reference is None:
+            return jsonify({"ok": False, "error": "参考页不存在", "details": []}), 404
+        if reference_id == job_id:
+            return jsonify({"ok": False, "error": "不能绑定自身作为参考页",
+                            "details": []}), 400
+
+        connection = get_db()
+        if db.get_binding(connection, job_id) is not None:
+            return jsonify({"ok": False, "error": "该页已绑定参考页，请先解除绑定",
+                            "details": []}), 409
+        if db.count_followers(connection, job_id):
+            return jsonify({"ok": False, "error": "作为参考页的页面不能跟随别页",
+                            "details": []}), 409
+        if db.get_binding(connection, reference_id) is not None:
+            return jsonify({"ok": False, "error": "参考页自身正在跟随别页，不能作为参考",
+                            "details": []}), 409
+        if db.count_followers(connection, reference_id) >= MAX_FOLLOWERS:
+            return jsonify({
+                "ok": False,
+                "error": f"每张参考页最多带 {MAX_FOLLOWERS} 张目标页",
+                "details": [],
+            }), 409
+
+        reference_h, reference_v = db.get_lines(connection, reference_id)
+        if len(reference_v) != 4 or len(reference_h) < 2:
+            return jsonify({
+                "ok": False,
+                "error": "参考页尚未划出有效格线（竖线 4 条、横线至少 2 条）",
+                "details": [],
+            }), 400
+        target_h, target_v = db.get_lines(connection, job_id)
+        if len(target_v) != 4 or len(target_h) < 2:
+            return jsonify({
+                "ok": False,
+                "error": "目标页尚未划出有效格线，无法绑定",
+                "details": [],
+            }), 400
+        if len(set(round(value, layout.COORD_DIGITS) for value in target_v)) != 4:
+            return jsonify({
+                "ok": False,
+                "error": "目标页左右外边线不合法，无法绑定",
+                "details": [],
+            }), 400
+
+        reasons, affected, new_v = _evaluate_conversion(
+            connection, job_id, reference_v, target_h, target_v)
+        paused = bool(reasons)
+        with db.transaction(connection):
+            if not paused:
+                db.set_lines(connection, job_id, target_h, new_v)
+            db.create_binding(
+                connection, job_id, reference_id, paused, reasons, affected)
+        return jsonify(_json_state(job_state(job_id)))
+
+    @app.post("/api/jobs/<int:job_id>/binding/confirm")
+    def api_confirm_binding(job_id):
+        load_job_or_404(job_id)
+        connection = get_db()
+        binding = db.get_binding(connection, job_id)
+        if binding is None:
+            return jsonify({"ok": False, "error": "该页未绑定参考页",
+                            "details": []}), 404
+        if not binding["paused"]:
+            return jsonify({"ok": False, "error": "该页正在跟随，无需确认",
+                            "details": []}), 409
+        reference_h, reference_v = db.get_lines(
+            connection, binding["reference_job_id"])
+        target_h, target_v = db.get_lines(connection, job_id)
+        try:
+            new_v = layout.converted_verticals(reference_v, target_v)
+        except layout.LayoutError as error:
+            # Still unusable: stay paused, keep the current lines.
+            with db.transaction(connection):
+                db.update_binding(connection, job_id, True,
+                                  binding["pause_reasons"],
+                                  binding["affected_boxes"])
+            return jsonify({
+                "ok": False,
+                "error": error.message,
+                "details": error.details,
+            }), 409
+        # The human accepts the new widths, so decisions are re-evaluated by
+        # the usual rules rather than pausing again.
+        with db.transaction(connection):
+            db.set_lines(connection, job_id, target_h, new_v)
+            db.update_binding(connection, job_id, False, [], [])
+        return jsonify(_json_state(job_state(job_id)))
+
+    @app.delete("/api/jobs/<int:job_id>/binding")
+    def api_unbind(job_id):
+        load_job_or_404(job_id)
+        connection = get_db()
+        if db.get_binding(connection, job_id) is None:
+            return jsonify({"ok": False, "error": "该页未绑定参考页",
+                            "details": []}), 404
+        with db.transaction(connection):
+            # Lines stay exactly as they were at the moment of unbinding.
+            db.delete_binding(connection, job_id)
         return jsonify(_json_state(job_state(job_id)))
 
     @app.post("/api/jobs/<int:job_id>/suggest-lines")
@@ -313,11 +557,46 @@ def _json_state(state):
         "status_counts": state["status_counts"],
         "can_export": state["can_export"],
         "cells": state["cells"],
+        "binding": state["binding"],
     }
 
 
 def _quote_filename(name):
     return quote(name)
+
+
+def _same_numbers(left, right):
+    return ([round(float(value), layout.COORD_DIGITS) for value in left]
+            == [round(float(value), layout.COORD_DIGITS) for value in right])
+
+
+def _evaluate_conversion(connection, target_id, reference_v, target_h, target_v):
+    """Try the reference's column ratios on one target page.
+
+    Returns (reasons, affected_boxes, new_vertical).  `reasons` is non-empty
+    when the conversion must not be applied: either the resulting lines are
+    invalid, or applying them would drop manual assignments/exclusions that
+    are currently in force.
+    """
+    reasons = []
+    affected = []
+    try:
+        new_v = layout.converted_verticals(reference_v, target_v)
+    except layout.LayoutError as error:
+        return [error.message], [], None
+
+    if len(target_h) < 2:
+        return ["目标页横线不足，无法构成有效格线"], [], new_v
+
+    old_grid = layout.Grid(target_h, target_v)
+    new_grid = layout.Grid(target_h, new_v)
+    decisions = db.get_decisions(connection, target_id)
+    boxes = db.get_boxes(connection, target_id)
+    affected = layout.invalidated_decisions(old_grid, new_grid, boxes, decisions)
+    if affected:
+        reasons.append(
+            "换算后的栏宽会使 %d 个已确认的人工归位/排除失效" % len(affected))
+    return reasons, affected, new_v
 
 
 def _suggest_lines(boxes):

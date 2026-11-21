@@ -244,6 +244,76 @@ class ReadingOrderTests(unittest.TestCase):
         self.assertEqual(rows[0]["price"], "1.2")
 
 
+class ColumnWidthTests(unittest.TestCase):
+    def test_ratios_sum_to_one(self):
+        ratios = layout.column_width_ratios([0, 100, 250, 400])
+        self.assertAlmostEqual(sum(ratios), 1.0)
+        self.assertAlmostEqual(ratios[0], 0.25)
+        self.assertAlmostEqual(ratios[1], 0.375)
+
+    def test_conversion_keeps_target_outer_borders(self):
+        converted = layout.converted_verticals([0, 100, 250, 400], [50, 70, 130, 250])
+        self.assertEqual(converted[0], 50)
+        self.assertEqual(converted[-1], 250)
+        self.assertAlmostEqual(converted[1], 100)   # 50 + 200*0.25
+        self.assertAlmostEqual(converted[2], 175)   # 50 + 200*0.625
+
+    def test_conversion_matches_reference_when_widths_equal(self):
+        reference = [0, 100, 200, 300]
+        target = [10, 60, 160, 310]
+        converted = layout.converted_verticals(reference, target)
+        widths = [converted[i + 1] - converted[i] for i in range(3)]
+        self.assertEqual([round(width / 300.0, 6) for width in widths],
+                         [round(width / 300.0, 6) for width in (100, 100, 100)])
+
+    def test_degenerate_target_width_rejected(self):
+        with self.assertRaises(layout.LayoutError):
+            layout.converted_verticals([0, 100, 200, 300], [50, 50, 50, 50])
+
+    def test_conversion_collapsing_a_column_is_rejected(self):
+        # A very narrow target page cannot represent the reference's tiny
+        # first column: the rounding collapses the first two verticals.
+        with self.assertRaises(layout.LayoutError):
+            layout.converted_verticals([0, 0.1, 200, 300], [0, 0.2, 0.4, 1])
+
+    def test_requires_four_reference_lines(self):
+        with self.assertRaises(layout.LayoutError):
+            layout.converted_verticals([0, 100, 200], [0, 100, 200, 300])
+
+    def test_invalidated_decisions_reports_only_manual_losses(self):
+        grid = layout.Grid(H, V)
+        boxes = sample_boxes()
+        decisions = {
+            5: {"kind": "cell", "target_cell": grid.cell_key(0, 1),
+                "overlap_cells": grid.overlapping_keys((90, 10, 110, 40))},
+        }
+        moved = layout.Grid(H, [0, 95, 200, 300])
+        affected = layout.invalidated_decisions(grid, moved, boxes, decisions)
+        self.assertEqual([entry["box_id"] for entry in affected], [5])
+        self.assertEqual(affected[0]["status"], "stale")
+
+    def test_invalidated_decisions_ignores_unrelated_line_move(self):
+        grid = layout.Grid(H, V)
+        boxes = sample_boxes()
+        decisions = {
+            5: {"kind": "cell", "target_cell": grid.cell_key(0, 1),
+                "overlap_cells": grid.overlapping_keys((90, 10, 110, 40))},
+        }
+        changed = layout.Grid([0, 100, 260], V)
+        self.assertEqual(
+            layout.invalidated_decisions(grid, changed, boxes, decisions), [])
+
+    def test_exclusion_loss_counts_as_invalidated(self):
+        grid = layout.Grid(H, V)
+        boxes = [make_box(9, "9", "边注", 95, 10, 105, 40)]
+        decisions = {
+            9: {"kind": "exclude", "target_cell": "",
+                "overlap_cells": grid.overlapping_keys((95, 10, 105, 40))},
+        }
+        self.assertTrue(layout.invalidated_decisions(
+            grid, layout.Grid(H, [0, 95, 200, 300]), boxes, decisions))
+
+
 class LayoutNormalisationTests(unittest.TestCase):
     def test_requires_four_vertical_lines(self):
         with self.assertRaises(layout.LayoutError):

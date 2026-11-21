@@ -341,6 +341,123 @@ def pending_count(evaluated):
 
 
 # ---------------------------------------------------------------------------
+# Cross-page column widths
+# ---------------------------------------------------------------------------
+
+MANUAL_STATUSES = ("assigned_manual", "excluded")
+
+
+def column_width_ratios(vertical):
+    """Widths of the three columns as fractions of the table width."""
+    if len(vertical) != 4:
+        raise LayoutError("参考页竖线必须恰好 4 条")
+    left, first, second, right = vertical
+    total = right - left
+    if total <= EPS:
+        raise LayoutError("参考页左右外边线过窄，无法换算栏宽")
+    return ((first - left) / total,
+            (second - first) / total,
+            (right - second) / total)
+
+
+def converted_verticals(reference_vertical, target_vertical):
+    """Apply the reference's column-width ratios to the target's outer lines.
+
+    The target keeps its own left/right borders; only the two inner vertical
+    lines move.  Raises LayoutError when the result is not a usable four-line
+    set (e.g. a zero-width column on the narrower target page).
+    """
+    reference = normalize_positions(reference_vertical, "参考页竖线")
+    target = normalize_positions(target_vertical, "目标页竖线")
+    if len(reference) != 4:
+        raise LayoutError("参考页竖线必须恰好 4 条，无法换算栏宽")
+    if len(target) != 4:
+        raise LayoutError("目标页竖线必须恰好 4 条，无法确定左右外边线")
+
+    left, right = target[0], target[3]
+    if right - left <= EPS:
+        raise LayoutError("目标页左右外边线过窄，无法换算栏宽")
+    ratio_a, ratio_b, _ratio_c = column_width_ratios(reference)
+    span = right - left
+    inner_a = round(left + span * ratio_a, COORD_DIGITS)
+    inner_b = round(left + span * (ratio_a + ratio_b), COORD_DIGITS)
+
+    result = sorted({left, inner_a, inner_b, right})
+    errors = []
+    if len(result) != 4:
+        errors.append("两条内竖线必须互不重合，也不能与左右外边线重合")
+    if not (left < inner_a < inner_b < right):
+        errors.append("两条内竖线必须严格落在左右外边线之间")
+    if errors:
+        raise LayoutError(
+            "参考页栏宽换算到目标页后格线无效：" + "；".join(errors), errors
+        )
+    return result
+
+
+def _decision_preserved(decision, old_item, new_item):
+    """Whether a currently valid human decision keeps its effect on new_item."""
+    if old_item["status"] not in MANUAL_STATUSES:
+        return True
+    if decision.get("kind") == "exclude":
+        return new_item["status"] == "excluded"
+    # A cell choice is preserved when the box still ends up in that cell:
+    # either the decision is still reused, or auto-placement happens to put
+    # the box in exactly the cell the human picked.  Being auto-placed in a
+    # different column silently changes the human's choice, so it counts as
+    # a loss too.
+    return (new_item["status"] in ("assigned_manual", "assigned_auto")
+            and new_item["cell_key"] == (decision.get("target_cell") or ""))
+
+
+def invalidated_decisions(old_grid, new_grid, boxes, decisions):
+    """Boxes whose confirmed human placement would be lost by new_grid.
+
+    Only decisions that are valid now (manual placement or exclusion) count:
+    the point of pausing is to protect work that is currently in force.  A
+    decision that is already stale has nothing left to lose.
+    """
+    before = {item["box_id"]: item
+              for item in evaluate(old_grid, boxes, decisions)}
+    after = {item["box_id"]: item
+             for item in evaluate(new_grid, boxes, decisions)}
+    affected = []
+    for box in boxes:
+        decision = decisions.get(box["id"])
+        if decision is None:
+            continue
+        old_item = before.get(box["id"])
+        new_item = after.get(box["id"])
+        if old_item is None or new_item is None:
+            continue
+        if not _decision_preserved(decision, old_item, new_item):
+            affected.append({
+                "box_id": box["id"],
+                "box_ref": box["box_ref"],
+                "text": (box["text"] or "").strip(),
+                "status": new_item["status"],
+                "status_label": new_item["status_label"],
+            })
+    return affected
+
+
+def confirmed_decision_boxes(grid, boxes, decisions):
+    """Boxes whose manual placement/exclusion is currently in force."""
+    evaluated = evaluate(grid, boxes, decisions)
+    result = []
+    for item in evaluated:
+        if item["status"] in MANUAL_STATUSES:
+            result.append({
+                "box_id": item["box_id"],
+                "box_ref": item["box_ref"],
+                "text": item["text"],
+                "status": item["status"],
+                "status_label": item["status_label"],
+            })
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Reading order and export
 # ---------------------------------------------------------------------------
 

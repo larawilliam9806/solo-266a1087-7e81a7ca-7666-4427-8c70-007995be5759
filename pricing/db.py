@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from contextlib import contextmanager
 from pathlib import Path
 
 SCHEMA_PATH = Path(__file__).with_name("schema.sql")
@@ -87,6 +88,7 @@ def get_boxes(connection, job_id):
 
 
 def set_lines(connection, job_id, horizontal, vertical):
+    """Replace a job's lines.  The caller commits (possibly several jobs)."""
     connection.execute("DELETE FROM lines WHERE job_id = ?", (job_id,))
     for position in horizontal:
         connection.execute(
@@ -98,6 +100,10 @@ def set_lines(connection, job_id, horizontal, vertical):
             "INSERT INTO lines (job_id, orientation, position) VALUES (?, 'v', ?)",
             (job_id, position),
         )
+
+
+def replace_lines(connection, job_id, horizontal, vertical):
+    set_lines(connection, job_id, horizontal, vertical)
     connection.commit()
 
 
@@ -146,3 +152,92 @@ def clear_decision(connection, job_id, box_id):
         "DELETE FROM decisions WHERE job_id = ? AND box_id = ?", (job_id, box_id)
     )
     connection.commit()
+
+
+# ---------------------------------------------------------------------------
+# Cross-page bindings
+# ---------------------------------------------------------------------------
+
+def _binding_record(row):
+    record = dict(row)
+    for field in ("pause_reasons", "affected_boxes"):
+        try:
+            record[field] = json.loads(record[field] or "[]")
+        except ValueError:
+            record[field] = []
+    record["paused"] = bool(record["paused"])
+    return record
+
+
+def get_binding(connection, target_job_id):
+    """The binding where this job is the follower, or None."""
+    row = connection.execute(
+        "SELECT * FROM bindings WHERE target_job_id = ?", (target_job_id,)
+    ).fetchone()
+    return _binding_record(row) if row else None
+
+
+def list_followers(connection, reference_job_id):
+    """Bindings where this job is the reference, oldest first."""
+    rows = connection.execute(
+        "SELECT * FROM bindings WHERE reference_job_id = ?"
+        " ORDER BY created_at, target_job_id", (reference_job_id,)
+    ).fetchall()
+    return [_binding_record(row) for row in rows]
+
+
+def count_followers(connection, reference_job_id):
+    row = connection.execute(
+        "SELECT COUNT(*) AS n FROM bindings WHERE reference_job_id = ?",
+        (reference_job_id,),
+    ).fetchone()
+    return int(row["n"])
+
+
+def create_binding(connection, target_job_id, reference_job_id, paused=False,
+                   pause_reasons=None, affected_boxes=None):
+    """Bind target -> reference.  The caller commits with any line writes."""
+    connection.execute(
+        "INSERT INTO bindings"
+        " (target_job_id, reference_job_id, paused, pause_reasons, affected_boxes)"
+        " VALUES (?, ?, ?, ?, ?)",
+        (target_job_id, reference_job_id, 1 if paused else 0,
+         json.dumps(list(pause_reasons or []), ensure_ascii=False),
+         json.dumps(list(affected_boxes or []), ensure_ascii=False)),
+    )
+
+
+def update_binding(connection, target_job_id, paused, pause_reasons=None,
+                   affected_boxes=None):
+    connection.execute(
+        "UPDATE bindings SET paused = ?, pause_reasons = ?, affected_boxes = ?,"
+        " updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')"
+        " WHERE target_job_id = ?",
+        (1 if paused else 0,
+         json.dumps(list(pause_reasons or []), ensure_ascii=False),
+         json.dumps(list(affected_boxes or []), ensure_ascii=False),
+         target_job_id),
+    )
+
+
+def delete_binding(connection, target_job_id):
+    connection.execute(
+        "DELETE FROM bindings WHERE target_job_id = ?", (target_job_id,)
+    )
+
+
+@contextmanager
+def transaction(connection):
+    """All-or-nothing write block.
+
+    The web layer commits once per request; if anything raises, every write
+    from this block is rolled back so no page keeps a half-applied state.
+    """
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        yield connection
+    except Exception:
+        connection.rollback()
+        raise
+    else:
+        connection.commit()

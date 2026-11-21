@@ -89,8 +89,16 @@
   }
 
   function draftMatchesState() {
+    if (state.binding && state.binding.follows) {
+      // Followers cannot edit verticals, so only the horizontals are compared.
+      return draft.h.join(",") === state.horizontal.join(",");
+    }
     return draft.h.join(",") === state.horizontal.join(",") &&
            draft.v.join(",") === state.vertical.join(",");
+  }
+
+  function isFollower() {
+    return !!(state.binding && state.binding.follows);
   }
 
   // ---------------------------------------------------------------- layout
@@ -224,7 +232,7 @@
       event.preventDefault();
       event.stopPropagation();
       if (isH) draft.h.splice(index, 1);
-      else draft.v.splice(index, 1);
+      else if (!isFollower()) draft.v.splice(index, 1);
       render();
     });
 
@@ -245,6 +253,7 @@
 
   window.addEventListener("pointermove", function (event) {
     if (!dragging) return;
+    if (dragging.orientation === "v" && isFollower()) return;
     const point = svgPoint(event);
     const delta = (dragging.orientation === "h" ? point.y : point.x) - dragging.start;
     const value = num(dragging.original[dragging.index] + delta);
@@ -309,6 +318,13 @@
 
     document.getElementById("pending-notice").hidden = !state.pending;
     document.getElementById("pending-count").textContent = state.pending;
+
+    const binding = state.binding || {};
+    document.getElementById("binding-status").textContent = binding.follows
+      ? (binding.paused
+          ? "· 已暂停跟随，保留原栏宽"
+          : "· 跟随参考页 #" + binding.follows)
+      : (binding.is_reference ? "· 已作为参考页" : "");
 
     const dirty = !draftMatchesState();
     applyButton.classList.toggle("primary", dirty);
@@ -410,6 +426,8 @@
     }).then(applyState).catch(fail);
   }
 
+  // ------------------------------------------------------------- status area
+
   // ------------------------------------------------------------- state sync
   function applyState(next) {
     state = next;
@@ -418,6 +436,22 @@
     render();
     renderInspector();
     updatePreview();
+    syncFollowControls();
+  }
+
+  function syncFollowControls() {
+    const follower = isFollower();
+    const addVertical = document.getElementById("add-vertical");
+    if (addVertical) {
+      addVertical.disabled = follower;
+      if (follower) addVertical.setAttribute("title", "跟随参考页时竖线不可单独修改");
+      else addVertical.removeAttribute("title");
+    }
+    if (verticalInput) {
+      verticalInput.readOnly = follower;
+      if (follower) verticalInput.setAttribute("title", "跟随参考页时竖线由参考页带动");
+      else verticalInput.removeAttribute("title");
+    }
   }
 
   function updatePreview() {
@@ -440,13 +474,24 @@
   function applyLines() {
     lineError.hidden = true;
     const attempted = { h: draft.h.slice(), v: draft.v.slice() };
+    const payloadVerticals = isFollower() ? state.vertical.slice() : attempted.v;
     request("/api/jobs/" + jobId + "/lines", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ horizontal: attempted.h, vertical: attempted.v }),
+      body: JSON.stringify({ horizontal: attempted.h, vertical: payloadVerticals }),
     }).then(function (data) {
       applyState(data);
       lineError.hidden = true;
+      if (data.followers && data.followers.some(function (entry) {
+        return entry.paused;
+      })) {
+        const paused = data.followers.filter(function (entry) {
+          return entry.paused;
+        });
+        lineError.hidden = false;
+        lineError.textContent = "已应用。有 " + paused.length +
+          " 张跟随页因格线无效或人工决定受影响而暂停跟随，保留原栏宽。";
+      }
     }).catch(function (error) {
       // The server refused the lines, so nothing was saved: put the canvas
       // and inputs back to the still-saved layout (the rejected draft is
@@ -463,7 +508,9 @@
   document.getElementById("suggest-lines").addEventListener("click", function () {
     request("/api/jobs/" + jobId + "/suggest-lines", { method: "POST" })
       .then(function (data) {
-        draft = { h: data.horizontal, v: data.vertical };
+        // Followers keep their derived verticals; only the rows are suggested.
+        draft = { h: data.horizontal,
+                  v: isFollower() ? state.vertical.slice() : data.vertical };
         render();
       })
       .catch(fail);
@@ -483,6 +530,7 @@
   });
 
   function addLine(orientation) {
+    if (orientation === "v" && isFollower()) return;
     const isH = orientation === "h";
     const list = isH ? draft.h : draft.v;
     const low = isH ? bounds.minY : bounds.minX;
@@ -505,8 +553,13 @@
   // and on apply; keep the canvas in sync as the user types.
   [verticalInput, horizontalInput].forEach(function (input) {
     input.addEventListener("input", function () {
-      if (input === verticalInput) draft.v = parseList(input.value);
-      else draft.h = parseList(input.value);
+      if (input === verticalInput) {
+        // Followers' verticals are driven by the reference and cannot change.
+        if (isFollower()) { syncInputs(); return; }
+        draft.v = parseList(input.value);
+      } else {
+        draft.h = parseList(input.value);
+      }
       render();
       // render() rewrites the other input; keep the focused one untouched.
       if (input === verticalInput) verticalInput.value = input.value;
@@ -521,6 +574,58 @@
       renderInspector();
     }
   });
+
+  // ------------------------------------------------------------- bindings
+  function sendBinding(method, path, body) {
+    const options = { method: method };
+    if (body) {
+      options.headers = { "Content-Type": "application/json" };
+      options.body = JSON.stringify(body);
+    }
+    return request("/api/jobs/" + jobId + path, options).then(function (data) {
+      state = data;
+      // The binding card is server-rendered; a bind/confirm/unbind changes the
+      // page's role, so reload to show the authoritative pause details.
+      window.location.reload();
+      return data;
+    });
+  }
+
+  const bindButton = document.getElementById("bind");
+  if (bindButton) {
+    bindButton.addEventListener("click", function () {
+      const select = document.getElementById("reference-select");
+      if (!select || !select.value) return;
+      sendBinding("POST", "/binding",
+        { reference_job_id: Number(select.value) }).catch(fail);
+    });
+  }
+
+  const confirmBinding = document.getElementById("confirm-binding");
+  if (confirmBinding) {
+    confirmBinding.addEventListener("click", function () {
+      sendBinding("POST", "/binding/confirm").catch(fail);
+    });
+  }
+
+  const unbind = document.getElementById("unbind");
+  if (unbind) {
+    unbind.addEventListener("click", function () {
+      if (!window.confirm("解除绑定？当前格线会保留。")) return;
+      sendBinding("DELETE", "/binding").catch(fail);
+    });
+  }
+
+  Array.prototype.forEach.call(
+    document.querySelectorAll("[data-select-box]"),
+    function (node) {
+      node.addEventListener("click", function () {
+        selectedId = Number(node.getAttribute("data-select-box"));
+        render();
+        renderInspector();
+      });
+    }
+  );
 
   // ------------------------------------------------------------ bootstrap
   const initial = document.getElementById("initial-state");

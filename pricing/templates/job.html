@@ -13,6 +13,7 @@
     <div>
       <strong>状态：</strong><span id="status-pill"></span>
       <span class="muted" id="status-counts"></span>
+      <span id="binding-status" class="muted"></span>
     </div>
     <form method="post" action="{{ url_for('job_delete', job_id=job.id) }}"
           onsubmit="return confirm('删除任务 {{ job.id }} 及其全部框和格线？');">
@@ -51,12 +52,93 @@
   </div>
 </section>
 
+<section class="card" id="binding-card">
+  <div class="panel-head">
+    <h2>跨页栏宽</h2>
+    {% if state.binding.follows %}
+      <span class="pill {% if state.binding.paused %}warn{% else %}good{% endif %}">
+        {% if state.binding.paused %}已暂停跟随{% else %}跟随中{% endif %}
+      </span>
+    {% endif %}
+  </div>
+
+  {% if state.binding.follows %}
+    <p>
+      本页跟随参考页
+      <a href="{{ url_for('job_view', job_id=state.binding.reference.id) }}">
+        #{{ state.binding.reference.id }} · {{ state.binding.reference.filename }}</a>。
+      左右外边线保持本页坐标，两条内竖线按参考页栏宽比例换算；横线可单独调整。
+    </p>
+    {% if state.binding.paused %}
+      <div class="notice warn" id="binding-paused">
+        <strong>已暂停跟随，保留原栏宽。</strong>
+        <ul class="reason-list">
+          {% for reason in state.binding.pause_reasons %}<li>{{ reason }}</li>{% endfor %}
+        </ul>
+        {% if state.binding.affected_boxes %}
+          <p>受影响的框：</p>
+          <ul class="affected-list">
+            {% for box in state.binding.affected_boxes %}
+            <li>
+              <button type="button" class="link" data-select-box="{{ box.box_id }}">
+                框 {{ box.box_ref or box.box_id }}{% if box.text %} · {{ box.text }}{% endif %}
+              </button>
+              <span class="muted">（{{ box.status_label }}）</span>
+            </li>
+            {% endfor %}
+          </ul>
+        {% endif %}
+        <button type="button" class="primary" id="confirm-binding">采用参考页当前栏宽并恢复跟随</button>
+      </div>
+    {% endif %}
+    <button type="button" class="danger ghost" id="unbind">解除绑定（保留当前格线）</button>
+  {% else %}
+    <p class="muted">
+      绑定一张已划好格的参考页后，本页只改横线；两条内竖线会按参考页的栏宽比例、
+      在本页左右外边线之间自动换算。参考页改竖线时本页同步更新。
+    </p>
+    {% if state.binding.is_reference %}
+      <p class="notice warn">本页已作为参考页被其他页面跟随，不能再跟随别页。</p>
+    {% elif jobs %}
+      <div class="bind-form">
+        <select id="reference-select">
+          {% for candidate in jobs %}
+          <option value="{{ candidate.id }}">#{{ candidate.id }} · {{ candidate.filename }}</option>
+          {% endfor %}
+        </select>
+        <button type="button" class="primary" id="bind">绑定为参考页</button>
+      </div>
+    {% else %}
+      <p class="muted">还没有其他任务可作为参考页。</p>
+    {% endif %}
+  {% endif %}
+
+  {% if state.binding.is_reference %}
+    <hr>
+    <h3>跟随本页的目标页（{{ state.binding.followers|length }} / {{ state.binding.max_followers }}）</h3>
+    <ul class="follower-list">
+      {% for follower in state.binding.followers %}
+      <li>
+        <a href="{{ url_for('job_view', job_id=follower.job_id) }}">
+          #{{ follower.job_id }} · {{ follower.filename }}</a>
+        {% if follower.paused %}
+          <span class="pill warn">已暂停</span>
+          <span class="muted">保留原栏宽，待人工确认</span>
+        {% else %}
+          <span class="pill good">跟随中</span>
+        {% endif %}
+      </li>
+      {% endfor %}
+    </ul>
+  {% endif %}
+</section>
+
 <section class="card">
   <div class="panel-head">
     <h2>格线</h2>
     <div class="line-actions">
       <button type="button" id="add-horizontal">添加横线</button>
-      <button type="button" id="add-vertical">添加竖线</button>
+      <button type="button" id="add-vertical" {% if state.binding.follows %}disabled title="跟随参考页时竖线不可单独修改"{% endif %}>添加竖线</button>
       <button type="button" id="suggest-lines">按文字框提议</button>
       <button type="button" id="reset-lines">还原已应用</button>
       <button type="button" class="primary" id="apply-lines">应用格线</button>
@@ -70,13 +152,17 @@
   <div class="line-editors">
     <label>竖线 x 坐标
       <input id="vertical-input" value="{{ state.vertical|join(', ') }}"
-             placeholder="例如 60, 300, 560, 800" inputmode="decimal">
+             placeholder="例如 60, 300, 560, 800" inputmode="decimal"
+             {% if state.binding.follows %}readonly title="跟随参考页时竖线由参考页带动"{% endif %}>
     </label>
     <label>横线 y 坐标
       <input id="horizontal-input" value="{{ state.horizontal|join(', ') }}"
              placeholder="例如 40, 120, 200, 880" inputmode="decimal">
     </label>
   </div>
+  {% if state.binding.follows %}
+  <p class="muted">竖线由参考页带动，只可修改横线。</p>
+  {% endif %}
   <p class="error" id="line-error" hidden></p>
 </section>
 

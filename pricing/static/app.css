@@ -135,6 +135,20 @@ th { color: var(--muted); font-weight: 600; }
 .inspector .note { margin-top: 10px; padding: 8px 10px; border-radius: 7px; background: #fbf0d9; color: #7a5200; font-size: 13px; }
 .inspector .note.stale { background: #f9e1de; color: #8a2a1c; }
 
+.bind-form { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; margin-top: 8px; }
+.bind-form select { padding: 7px 9px; border: 1px solid var(--line); border-radius: 7px; font: inherit; flex: 1 1 320px; }
+#binding-card h3 { font-size: 15px; margin: 14px 0 8px; }
+#binding-card hr { border: none; border-top: 1px solid var(--line); margin: 16px 0; }
+.reason-list, .affected-list, .follower-list { padding-left: 20px; margin: 6px 0; }
+.affected-list { list-style: none; padding-left: 0; }
+.affected-list li { margin: 4px 0; }
+button.link { padding: 0; border: none; background: none; color: var(--accent); text-decoration: underline; cursor: pointer; font: inherit; }
+.follower-list li { margin: 6px 0; }
+#binding-card .notice { margin-top: 10px; }
+#binding-card .notice .primary { margin-top: 8px; }
+button[disabled] { opacity: .5; cursor: not-allowed; }
+input[readonly] { background: #f1ede4; color: var(--muted); }
+
 .box-rect { cursor: pointer; }
 .box-rect.sel { stroke-width: 3; }
 .box-label { font-size: 11px; pointer-events: none; fill: #241f18; }
